@@ -56,7 +56,7 @@ class TestToolsBasic(unittest.TestCase):
             self.assertEqual(p.read_text(encoding="utf-8"), "hello world\n")
 
             # Rollback.
-            rb = rollback(token, overwrite=False)
+            rb = rollback(token, overwrite=True)
             self.assertIn("Rollback OK", rb)
             self.assertEqual(p.read_text(encoding="utf-8"), "hello\n")
 
@@ -94,7 +94,7 @@ class TestToolsBasic(unittest.TestCase):
         self.assertTrue(res.strip().startswith("{"), msg=res)
 
     def test_project_workflow_suggest_returns_json(self):
-        res = project_workflow_suggest(root="/home/deluxxe/Documents/AARIS", include_commands=False)
+        res = project_workflow_suggest(root=".", include_commands=False)
         self.assertTrue(res.strip().startswith("{"), msg=res)
 
 

@@ -348,7 +348,8 @@ def rollback(token: str, overwrite: bool = False) -> str:
             backup_path = Path(str(meta.get("backup_path") or "")).expanduser()
             if not backup_path.is_file():
                 return f"Error: backup no existe: {backup_path}"
-            # Para rollback de archivo, restauramos sobre el contenido actual por defecto.
+            if original_path.exists() and not overwrite:
+                return f"Error: destino existe: {original_path}. Usa overwrite=true."
             original_path.parent.mkdir(parents=True, exist_ok=True)
             original_path.write_bytes(backup_path.read_bytes())
             return f"Rollback OK: restaurado {original_path}"
@@ -586,6 +587,8 @@ def edit_file(path: str, new_content: str) -> str:
             except Exception:
                 rollback_res = rollback(token, overwrite=True)
                 return f"Error: JSON inválido en {abs_path}. {rollback_res}"
+        _read_file_cached.cache_clear()
+        _exists_path_cached.cache_clear()
         return f"Archivo actualizado: {abs_path}. ROLLBACK_TOKEN={token}"
     except Exception as e:
         return f"Error al editar: {e}"
@@ -647,6 +650,8 @@ def search_replace_in_file(
                 if rb.startswith("Error"):
                     rollback_res = rollback(token, overwrite=True)
                     return f"Error: validación Python falló en {abs_path}. {rollback_res}"
+            _read_file_cached.cache_clear()
+            _exists_path_cached.cache_clear()
             return f"{msg} Archivo: {abs_path}. ROLLBACK_TOKEN={token}"
     except Exception as e:
         return f"Error en search_replace: {e}"
@@ -1146,8 +1151,9 @@ def validate_python_syntax(path: str) -> str:
         p = Path(resolved)
         if not p.is_file():
             return f"Error: {p} no es un archivo."
+        import sys
         proc = subprocess.run(
-            ["python", "-m", "py_compile", str(p)],
+            [sys.executable, "-m", "py_compile", str(p)],
             capture_output=True,
             text=True,
             timeout=30,
@@ -2566,7 +2572,9 @@ def schedule_agent_task(cron_expr: str, prompt: str, task_name: str) -> str:
     """Crea una tarea programada usando crontab del usuario para lanzar el agente."""
     try:
         agent_script = str(Path(__file__).resolve().parent / "main.py")
-        command = f"python {agent_script} --run-prompt '{prompt}' >> ~/.aaris/cron.log 2>&1"
+        import shlex, sys
+        prompt_q = shlex.quote(prompt)
+        command = f"{sys.executable} {agent_script} --run-prompt {prompt_q} >> ~/.aaris/cron.log 2>&1"
         cron_line = f"{cron_expr} {command}\n"
         
         cron_file = Path.home() / ".aaris" / "crontab.txt"

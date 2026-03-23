@@ -1270,6 +1270,7 @@ def main():
                     console.print(Markdown(reply_content))
 
             # Log simple tipo "Open Claw": usuario + tools usados + salida truncada.
+            tool_calls_log: list = []
             try:
                 tool_calls_extracted: list[dict[str, Any]] = []
                 tool_results: list[str] = []
@@ -1338,7 +1339,7 @@ def main():
 
             # Persistir memoria entre sesiones (si no se reinició).
             _turn_counter += 1
-            if _turn_counter % MEMORY_UPDATE_EVERY == 0 or locals().get("tool_calls_log"):
+            if _turn_counter % MEMORY_UPDATE_EVERY == 0 or tool_calls_log:
                 memory = _update_memory(messages, memory, opts)
                 _save_memory(memory_path, memory)
 
