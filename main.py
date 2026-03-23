@@ -69,6 +69,7 @@ console = Console()
 MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
 MAX_TOOL_ROUNDS = int(os.environ.get("AARIS_MAX_TOOL_ROUNDS", "12"))
 MAX_CONTEXT_MESSAGES = int(os.environ.get("AARIS_MAX_CONTEXT_MESSAGES", "20"))
+MEMORY_UPDATE_EVERY = int(os.environ.get("AARIS_MEMORY_UPDATE_EVERY", "5"))
 PLAN_MODE = os.environ.get("AARIS_PLAN_MODE", "off")  # off | auto | confirm
 DRY_RUN = os.environ.get("AARIS_DRY_RUN", "false").strip().lower() in ("1", "true", "yes", "si", "sí", "on")
 PREVIEW_MUTATIONS = os.environ.get("AARIS_PREVIEW_MUTATIONS", "true").strip().lower() in ("1", "true", "yes", "si", "sí", "on")
@@ -792,6 +793,38 @@ def _run_tool_loop(
     return reply_content
 
 
+def _is_simple_conversational(text: str) -> bool:
+    """Detecta preguntas que claramente no necesitan herramientas."""
+    s = text.lower().strip()
+    simple_patterns = [
+        r"^hola",
+        r"^(qu[eé] eres|qui[eé]n eres)",
+        r"^(qu[eé] puedes hacer|qu[eé] sabes hacer)",
+        r"^(buenos? d[ií]as?|buenas? tardes?|buenas? noches?)",
+        r"^(c[oó]mo est[aá]s|qu[eé] tal)",
+        r"^(gracias|de nada|ok|vale|perfecto|entendido)",
+        r"^(ayuda|help)$",
+    ]
+    return any(re.search(p, s) for p in simple_patterns)
+
+
+def _run_simple_chat_streaming(messages: list, options: dict) -> str:
+    """Versión con streaming para respuestas visibles inmediatamente."""
+    full_response = ""
+    console.print("\n[bold purple]Asistente:[/bold purple] ", end="")
+    try:
+        from ollama import chat
+        stream = chat(model=MODEL, messages=messages, options=options or None, stream=True)
+        for chunk in stream:
+            token = chunk.get("message", {}).get("content") or ""
+            console.print(token, end="")
+            full_response += token
+        console.print()
+    except Exception as e:
+        console.print(f"\n[red]Error de stream: {e}[/red]")
+    return full_response
+
+
 def main():
     opts = _chat_options()
     memory_path = os.path.abspath(DEFAULT_MEMORY_PATH)
@@ -874,6 +907,7 @@ def main():
     ]
 
     tool_map = {f.__name__: f for f in available_tools}
+    _turn_counter = 0
 
     import sys
     if "--server" in sys.argv:
@@ -1222,13 +1256,18 @@ def main():
             turn_start_idx = len(messages)
             messages.append({"role": "user", "content": user_input})
 
-            turn_tool_start = datetime.now().timestamp()
-            reply_content = _run_tool_loop(messages, available_tools, tool_map, opts)
-            turn_tool_ms = int((datetime.now().timestamp() - turn_tool_start) * 1000)
+            if _is_simple_conversational(user_input) and PLAN_MODE == "off":
+                reply_content = _run_simple_chat_streaming(messages, opts)
+                messages.append({"role": "assistant", "content": reply_content})
+                turn_tool_ms = 0
+            else:
+                turn_tool_start = datetime.now().timestamp()
+                reply_content = _run_tool_loop(messages, available_tools, tool_map, opts)
+                turn_tool_ms = int((datetime.now().timestamp() - turn_tool_start) * 1000)
 
-            if reply_content.strip():
-                console.print("\n[bold purple]Asistente:[/bold purple]")
-                console.print(Markdown(reply_content))
+                if reply_content.strip():
+                    console.print("\n[bold purple]Asistente:[/bold purple]")
+                    console.print(Markdown(reply_content))
 
             # Log simple tipo "Open Claw": usuario + tools usados + salida truncada.
             try:
@@ -1298,8 +1337,10 @@ def main():
             messages = _prune_messages(messages, keep_last=MAX_CONTEXT_MESSAGES)
 
             # Persistir memoria entre sesiones (si no se reinició).
-            memory = _update_memory(messages, memory, opts)
-            _save_memory(memory_path, memory)
+            _turn_counter += 1
+            if _turn_counter % MEMORY_UPDATE_EVERY == 0 or locals().get("tool_calls_log"):
+                memory = _update_memory(messages, memory, opts)
+                _save_memory(memory_path, memory)
 
         except KeyboardInterrupt:
             console.print("\n[bold yellow]Cancelado. Saliendo…[/bold yellow]")
