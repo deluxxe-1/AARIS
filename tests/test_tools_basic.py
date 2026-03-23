@@ -20,6 +20,8 @@ class TestToolsBasic(unittest.TestCase):
         os.environ["AARIS_BACKUP_PATH"] = self._tmp_backup
 
     def tearDown(self) -> None:
+        import tools
+        tools._POLICY_CACHE = None
         if self._old_trash is None:
             os.environ.pop("AARIS_USE_TRASH", None)
         else:

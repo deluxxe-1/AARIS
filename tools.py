@@ -1745,6 +1745,8 @@ def append_file(path: str, content: str) -> str:
         with _path_lock(abs_path):
             with open(abs_path, "a", encoding="utf-8") as f:
                 f.write(content)
+        _read_file_cached.cache_clear()
+        _exists_path_cached.cache_clear()
         if token:
             return f"Contenido añadido a {abs_path}. ROLLBACK_TOKEN={token}"
         return f"Contenido añadido a {abs_path}."
@@ -1792,6 +1794,8 @@ def insert_after(path: str, anchor_text: str, insert_text: str, occurrence_index
                 except Exception:
                     rollback_res = rollback(token, overwrite=True)
                     return f"Error: JSON inválido en {abs_path}. {rollback_res}"
+            _read_file_cached.cache_clear()
+            _exists_path_cached.cache_clear()
             return f"Insertado después de anchor_text en {abs_path}. ROLLBACK_TOKEN={token}"
     except Exception as e:
         return f"Error en insert_after: {e}"
@@ -2559,8 +2563,9 @@ def delegate_task(prompt: str) -> str:
     """Delega una tarea a una nueva instancia del agente ejecutando main.py --run-prompt."""
     try:
         agent_script = str(Path(__file__).resolve().parent / "main.py")
+        import sys
         proc = subprocess.run(
-            ["python", agent_script, "--run-prompt", prompt],
+            [sys.executable, agent_script, "--run-prompt", prompt],
             capture_output=True, text=True, timeout=300, env={**os.environ}
         )
         out = proc.stdout + proc.stderr
