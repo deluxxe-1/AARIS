@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 import difflib
 from typing import Any
 from datetime import datetime
@@ -74,14 +75,10 @@ PLAN_MODE = os.environ.get("AARIS_PLAN_MODE", "off")  # off | auto | confirm
 DRY_RUN = os.environ.get("AARIS_DRY_RUN", "false").strip().lower() in ("1", "true", "yes", "si", "sí", "on")
 PREVIEW_MUTATIONS = os.environ.get("AARIS_PREVIEW_MUTATIONS", "true").strip().lower() in ("1", "true", "yes", "si", "sí", "on")
 PREVIEW_CONFIRM_ALWAYS = os.environ.get("AARIS_PREVIEW_CONFIRM_ALWAYS", "true").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "si",
-    "sí",
-    "on",
+    "1", "true", "yes", "si", "sí", "on",
 )
 DIFF_MAX_LINES = int(os.environ.get("AARIS_DIFF_MAX_LINES", "300"))
+BACKUP_MAX_AGE_DAYS = int(os.environ.get("AARIS_BACKUP_MAX_AGE_DAYS", "7"))
 
 DEFAULT_MEMORY_PATH = os.environ.get(
     "AARIS_MEMORY_PATH",
@@ -96,6 +93,150 @@ DEFAULT_LOG_PATH = os.environ.get(
 DEFAULT_APP_DIR = os.environ.get("AARIS_APP_DIR", os.path.join(os.getcwd(), ".aaris"))
 UNDO_REDO_PATH = os.environ.get("AARIS_UNDO_REDO_PATH", os.path.join(DEFAULT_APP_DIR, "undo_redo.json"))
 
+
+# ---------------------------------------------------------------------------
+# Tool groups — selección dinámica según la petición del usuario
+# ---------------------------------------------------------------------------
+
+def _build_tool_groups(available_tools: list) -> dict[str, list]:
+    """Construye grupos de herramientas indexados por nombre de función."""
+    by_name = {f.__name__: f for f in available_tools}
+
+    def _pick(*names: str) -> list:
+        return [by_name[n] for n in names if n in by_name]
+
+    return {
+        "files": _pick(
+            "create_file", "edit_file", "read_file", "search_replace_in_file",
+            "append_file", "insert_after", "delete_path", "copy_path", "move_path",
+            "list_directory", "glob_find", "exists_path", "describe_path",
+            "create_folder", "apply_template",
+        ),
+        "system": _pick(
+            "run_command", "run_command_checked", "run_command_retry",
+            "service_status", "service_restart", "service_health_report",
+            "service_restart_with_deps", "service_wait_active",
+            "list_processes", "disk_usage", "install_packages",
+        ),
+        "search": _pick(
+            "fuzzy_search_paths", "build_text_index", "rag_query",
+            "tail_file", "estimate_dir", "count_dir_children_matches",
+        ),
+        "project": _pick(
+            "detect_project", "project_workflow_suggest",
+            "apply_unified_patch", "ast_list_functions", "ast_read_function",
+        ),
+        "docker": _pick("docker_ps", "docker_logs", "docker_exec"),
+        "data":   _pick("db_query_sqlite"),
+        "admin":  _pick(
+            "rollback", "rollback_tokens", "policy_show", "policy_set",
+            "policy_reset", "resolve_path", "delegate_task", "schedule_agent_task",
+        ),
+    }
+
+
+def _select_tools(user_input: str, available_tools: list, tool_groups: dict[str, list]) -> list:
+    """
+    Selecciona el subconjunto de herramientas relevantes para la petición.
+    Reduce el contexto enviado al modelo de ~50 a ~15 tools en la mayoría de casos.
+    """
+    s = user_input.lower()
+    selected: list = []
+    added_names: set[str] = set()
+
+    def _add_group(group_name: str) -> None:
+        for t in tool_groups.get(group_name, []):
+            if t.__name__ not in added_names:
+                selected.append(t)
+                added_names.add(t.__name__)
+
+    # Archivos: siempre incluidos (base de casi todo)
+    _add_group("files")
+
+    # Sistema / comandos
+    if any(k in s for k in [
+        "ejecuta", "comando", "instala", "sudo", "script", "terminal",
+        "servicio", "service", "systemctl", "puerto", "proceso", "ps ",
+        "reinicia", "restart", "activo", "activa",
+    ]):
+        _add_group("system")
+
+    # Búsqueda / RAG
+    if any(k in s for k in [
+        "busca", "encuentra", "search", "índice", "indice", "rag",
+        "fuzzy", "grep", "contiene", "ocurrencia",
+    ]):
+        _add_group("search")
+
+    # Proyecto / código
+    if any(k in s for k in [
+        "proyecto", "project", "test", "pytest", "función", "funcion",
+        "clase", "parche", "patch", "diff", "ast", "método", "metodo",
+        "compilar", "lint", "importa",
+    ]):
+        _add_group("project")
+
+    # Docker
+    if any(k in s for k in [
+        "docker", "contenedor", "container", "imagen", "compose",
+    ]):
+        _add_group("docker")
+
+    # Base de datos
+    if any(k in s for k in [
+        "sqlite", "base de datos", "sql", "db", "tabla", "query", "select",
+    ]):
+        _add_group("data")
+
+    # Admin / rollback / política
+    if any(k in s for k in [
+        "rollback", "deshacer", "política", "politica", "policy",
+        "delega", "agenda", "cron", "programa",
+    ]):
+        _add_group("admin")
+
+    # Si el resultado es solo "files" (no matchó nada específico) y la petición
+    # parece compleja, mandamos todo como fallback seguro.
+    only_files = len(added_names) <= len(tool_groups.get("files", []))
+    if only_files and len(s.split()) > 6:
+        return available_tools
+
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Limpieza de backups antiguos
+# ---------------------------------------------------------------------------
+
+def _cleanup_old_backups(max_age_days: int = 7) -> None:
+    """Elimina backups con más de max_age_days días para no llenar el disco."""
+    try:
+        from tools import _backup_base_dir
+        base = _backup_base_dir()
+        cutoff = time.time() - max_age_days * 86400
+        files_cleaned = 0
+        for f in (base / "files").glob("*.bak"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    files_cleaned += 1
+            except Exception:
+                pass
+        for f in (base / "meta").glob("*.json"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except Exception:
+                pass
+        if files_cleaned:
+            console.print(f"[dim]🧹 Backups antiguos eliminados: {files_cleaned}[/dim]")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Resto de funciones sin cambios
+# ---------------------------------------------------------------------------
 
 def _chat_options() -> dict[str, Any]:
     opts: dict[str, Any] = {}
@@ -144,7 +285,7 @@ SYSTEM_PROMPT = """Eres AARIS, un asistente de sistema para Linux. Objetivo: res
 - Responde en español, claro y directo.
 - Para crear/editar/leer archivos, listar carpetas, buscar rutas o ejecutar comandos del sistema, usa SIEMPRE las herramientas disponibles en lugar de inventar resultados.
 - Antes de editar un archivo grande, lee su contenido con read_file o usa search_replace_in_file para cambios localizados.
-- Si el usuario menciona rutas “humanas” como `Documents`, `Descargas`, `Escritorio` o similares, usa `resolve_path` para mapearlas a la carpeta real dentro del `$HOME`.
+- Si el usuario menciona rutas "humanas" como `Documents`, `Descargas`, `Escritorio` o similares, usa `resolve_path` para mapearlas a la carpeta real dentro del `$HOME`.
 - Para borrar usa `delete_path` (mueve a Trash si está activo). Si es una carpeta con `recursive=true`, confirma (`confirm=true`) siempre.
 - Para borrados recursivos en carpetas muy grandes, pasa `glob_filter` para borrar solo partes (o usa una subruta más específica).
 - Para instalar paquetes del sistema, usa `install_packages` y respeta `confirm=true` cuando aplique.
@@ -186,7 +327,6 @@ def _load_memory(memory_path: str) -> dict[str, Any]:
         data.setdefault("last_turns", [])
         return data
     except Exception:
-        # Si la memoria está corrupta, reiniciamos sin romper el agente.
         return {
             "memory_summary": "",
             "stable_facts": [],
@@ -207,29 +347,22 @@ def _save_memory(memory_path: str, memory: dict[str, Any]) -> None:
 def _build_prefix_messages(memory: dict[str, Any]) -> list[dict[str, Any]]:
     prefix: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     if memory.get("memory_summary"):
-        prefix.append(
-            {
-                "role": "system",
-                "content": "Memoria persistente del usuario (resumen estable):\n"
-                + str(memory.get("memory_summary")),
-            }
-        )
+        prefix.append({
+            "role": "system",
+            "content": "Memoria persistente del usuario (resumen estable):\n" + str(memory.get("memory_summary")),
+        })
     if memory.get("stable_facts"):
-        prefix.append(
-            {
-                "role": "system",
-                "content": "Hechos estables del usuario:\n"
-                + "\n".join(str(x) for x in (memory.get("stable_facts") or [])[:50]),
-            }
-        )
+        prefix.append({
+            "role": "system",
+            "content": "Hechos estables del usuario:\n"
+            + "\n".join(str(x) for x in (memory.get("stable_facts") or [])[:50]),
+        })
     if memory.get("preferences"):
-        prefix.append(
-            {
-                "role": "system",
-                "content": "Preferencias detectadas del usuario (para decidir rutas y estilo):\n"
-                + json.dumps(memory.get("preferences") or {}, ensure_ascii=False),
-            }
-        )
+        prefix.append({
+            "role": "system",
+            "content": "Preferencias detectadas del usuario (para decidir rutas y estilo):\n"
+            + json.dumps(memory.get("preferences") or {}, ensure_ascii=False),
+        })
     return prefix
 
 
@@ -237,17 +370,15 @@ def _prune_messages(messages: list[dict[str, Any]], keep_last: int) -> list[dict
     if len(messages) <= keep_last:
         return messages
     prefix = messages[:2] if len(messages) >= 2 and messages[0].get("role") == "system" else messages[:1]
-    tail = messages[-(keep_last - len(prefix)) :]
+    tail = messages[-(keep_last - len(prefix)):]
     return prefix + tail
 
 
 def _extract_recent_for_memory(messages: list[dict[str, Any]], max_items: int = 10) -> list[dict[str, Any]]:
-    # Nos quedamos solo con user/assistant (ignoramos tool messages para evitar ruido y datos técnicos).
     reduced: list[dict[str, Any]] = []
     for m in messages:
         if m.get("role") in ("user", "assistant", "system"):
             reduced.append({"role": m.get("role"), "content": m.get("content", "")})
-    # Queremos las últimas interacciones reales, así que cortamos por el final.
     reduced = [m for m in reduced if m["role"] in ("user", "assistant")]
     return reduced[-max_items:]
 
@@ -255,22 +386,9 @@ def _extract_recent_for_memory(messages: list[dict[str, Any]], max_items: int = 
 def _heuristic_requires_tools(user_input: str) -> bool:
     s = user_input.lower()
     keywords = [
-        "crear",
-        "editar",
-        "actualizar",
-        "borrar",
-        "eliminar",
-        "borra",
-        "carpeta",
-        "directorio",
-        "archivo",
-        "comando",
-        "ejecuta",
-        "instalar",
-        "rm ",
-        "cp ",
-        "mv ",
-        "sudo ",
+        "crear", "editar", "actualizar", "borrar", "eliminar", "borra",
+        "carpeta", "directorio", "archivo", "comando", "ejecuta", "instalar",
+        "rm ", "cp ", "mv ", "sudo ",
     ]
     return any(k in s for k in keywords)
 
@@ -288,18 +406,11 @@ def _plan_turn(user_input: str, messages: list[dict[str, Any]], opts: dict[str, 
             f"Tarea del usuario: {user_input}"
         ),
     }
-
-    memless = messages[:]
-    planning_messages = memless + [planning_user]
+    planning_messages = messages[:] + [planning_user]
     plan_opts = dict(opts)
     plan_opts["temperature"] = 0.1
-
     try:
-        response = chat(
-            model=MODEL,
-            messages=planning_messages,
-            options=plan_opts or None,
-        )
+        response = chat(model=MODEL, messages=planning_messages, options=plan_opts or None)
         content = response["message"].get("content") or ""
         parsed = json.loads(content)
         if isinstance(parsed, dict):
@@ -308,7 +419,6 @@ def _plan_turn(user_input: str, messages: list[dict[str, Any]], opts: dict[str, 
             return parsed
     except Exception:
         pass
-
     return {
         "requires_tools": _heuristic_requires_tools(user_input),
         "summary": "Plan aproximado (sin respuesta JSON válida).",
@@ -322,11 +432,9 @@ def _update_memory(
     memory: dict[str, Any],
     opts: dict[str, Any],
 ) -> dict[str, Any]:
-    # Llamada ligera: genera un JSON pequeño con resumen estable y preferencias.
     recent = _extract_recent_for_memory(messages, max_items=10)
     if not recent:
         return memory
-
     mem_prompt = {
         "role": "system",
         "content": (
@@ -336,23 +444,18 @@ def _update_memory(
             "Regla: solo agrega información que sea estable (preferencias) y un resumen corto de lo ocurrido."
         ),
     }
-
     user_payload = {
         "current_memory_summary": memory.get("memory_summary", ""),
         "recent_turns": recent,
     }
-
     mem_options = dict(opts)
-    # La memoria debe ser determinista.
     mem_options["temperature"] = 0.1
-
     response = chat(
         model=MODEL,
         messages=[mem_prompt, {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}],
         options=mem_options or None,
     )
     content = response["message"].get("content") or ""
-
     try:
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
@@ -426,35 +529,20 @@ def _run_tool_loop(
             console.print(f"[dim italic]⚙ {function_name}({args_preview})[/dim italic]")
 
             mutation_tools = {
-                "create_file",
-                "edit_file",
-                "search_replace_in_file",
-                "create_folder",
-                "append_file",
-                "insert_after",
-                "delete_path",
-                "run_command",
-                "copy_path",
-                "move_path",
+                "create_file", "edit_file", "search_replace_in_file",
+                "create_folder", "append_file", "insert_after",
+                "delete_path", "run_command", "copy_path", "move_path",
             }
 
             tool_risk = {
-                "run_command": "high",
-                "delete_path": "high",
-                "service_restart": "high",
-                "service_restart_with_deps": "high",
-                "service_health_report": "low",
-                "service_wait_active": "medium",
-                "move_path": "medium",
-                "copy_path": "medium",
-                "edit_file": "medium",
-                "search_replace_in_file": "medium",
-                "apply_unified_patch": "high",
-                "install_packages": "high",
-                "append_file": "medium",
-                "insert_after": "medium",
-                "create_file": "medium",
-                "create_folder": "low",
+                "run_command": "high", "delete_path": "high",
+                "service_restart": "high", "service_restart_with_deps": "high",
+                "service_health_report": "low", "service_wait_active": "medium",
+                "move_path": "medium", "copy_path": "medium",
+                "edit_file": "medium", "search_replace_in_file": "medium",
+                "apply_unified_patch": "high", "install_packages": "high",
+                "append_file": "medium", "insert_after": "medium",
+                "create_file": "medium", "create_folder": "low",
             }
             need_human_confirm = (
                 PREVIEW_CONFIRM_ALWAYS
@@ -462,10 +550,8 @@ def _run_tool_loop(
                 or tool_risk.get(function_name) == "high"
             )
 
-            # Detección adicional de rutas/acciones especialmente sensibles.
             try:
                 sensitive_prefixes = ["/etc/", "/usr/", "/var/"]
-                home = os.path.expanduser("~")
                 sensitive_substrings = ["/.ssh", "/.gnupg", "/.kube", "/.local/share", "/.config"]
                 path_guess = None
                 if function_name == "delete_path":
@@ -483,7 +569,6 @@ def _run_tool_loop(
             except Exception:
                 pass
 
-            # Confirmación por tipo de acción.
             if function_name in ("copy_path", "move_path") and bool(arguments.get("overwrite")):
                 need_human_confirm = True
             if function_name in ("apply_unified_patch", "install_packages", "service_restart"):
@@ -503,11 +588,7 @@ def _run_tool_loop(
                             if arguments.get("glob_filter"):
                                 preview += f"\nFiltro: glob_filter={arguments.get('glob_filter')!r}"
                                 try:
-                                    m = count_dir_children_matches(
-                                        p,
-                                        arguments.get("glob_filter") or "",
-                                        show_hidden=False,
-                                    )
+                                    m = count_dir_children_matches(p, arguments.get("glob_filter") or "", show_hidden=False)
                                     preview += f"\nCoincidencias inmediatas: {m}"
                                 except Exception:
                                     pass
@@ -532,14 +613,12 @@ def _run_tool_loop(
                 if preview:
                     console.print(f"[dim]Preflight:[/dim]\n{preview}")
 
-                # Preview de diff para ediciones de texto.
                 try:
                     if function_name == "edit_file":
                         p = arguments.get("path") or ""
                         old = read_file(p, max_chars=80000)
                         if isinstance(old, str) and not old.startswith("Error:") and old.strip():
                             new_content = arguments.get("new_content") or ""
-                            # Previsualización semántica para JSON (cambios de keys).
                             if str(p).lower().endswith(".json"):
                                 try:
                                     old_obj = json.loads(old)
@@ -549,47 +628,31 @@ def _run_tool_loop(
                                         new_keys = set(new_obj.keys())
                                         added = sorted(list(new_keys - old_keys))[:20]
                                         removed = sorted(list(old_keys - new_keys))[:20]
-                                        changed = []
-                                        for k in list(old_keys & new_keys)[:50]:
-                                            if old_obj.get(k) != new_obj.get(k):
-                                                changed.append(k)
+                                        changed = [k for k in list(old_keys & new_keys)[:50] if old_obj.get(k) != new_obj.get(k)]
                                         if added or removed or changed:
-                                            console.print(
-                                                "[dim]JSON keys diff:[/dim] "
-                                                f"added={added} removed={removed} changed_head={changed[:20]}"
-                                            )
+                                            console.print(f"[dim]JSON keys diff:[/dim] added={added} removed={removed} changed_head={changed[:20]}")
                                 except Exception:
                                     pass
                             diff_lines_iter = difflib.unified_diff(
-                                old.splitlines(True),
-                                new_content.splitlines(True),
-                                fromfile="before",
-                                tofile="after",
-                                n=3,
+                                old.splitlines(True), new_content.splitlines(True),
+                                fromfile="before", tofile="after", n=3,
                             )
                             diff_lines_list = list(diff_lines_iter)
                             diff_text = "".join(diff_lines_list[:DIFF_MAX_LINES])
                             if diff_text.strip():
                                 console.print(f"[dim]Diff (preview):[/dim]\n{diff_text}")
                             changed_lines = [
-                                l
-                                for l in diff_lines_list
+                                l for l in diff_lines_list
                                 if (l.startswith("+") or l.startswith("-"))
-                                and not l.startswith("+++")
-                                and not l.startswith("---")
+                                and not l.startswith("+++") and not l.startswith("---")
                             ]
                             if len(changed_lines) > 60 or len(diff_lines_list) > 200:
                                 if need_human_confirm and not DRY_RUN and not result:
-                                    ans = Prompt.ask(
-                                        "Este `edit_file` parece un cambio grande. ¿Confirmas? (s/N)",
-                                        default="N",
-                                    ).strip().lower()
+                                    ans = Prompt.ask("Este `edit_file` parece un cambio grande. ¿Confirmas? (s/N)", default="N").strip().lower()
                                     if ans not in ("s", "si", "sí", "y", "yes"):
                                         result = "Acción cancelada por el usuario."
                             elif len(changed_lines) <= 10 and not DRY_RUN:
-                                console.print(
-                                    "[dim]Sugerencia: para cambios pequeños, intenta `search_replace_in_file`/`insert_after` en vez de `edit_file` completo.[/dim]"
-                                )
+                                console.print("[dim]Sugerencia: para cambios pequeños, intenta `search_replace_in_file`/`insert_after` en vez de `edit_file` completo.[/dim]")
 
                     elif function_name == "search_replace_in_file":
                         p = arguments.get("path") or ""
@@ -601,11 +664,8 @@ def _run_tool_loop(
                             if old_text in old:
                                 predicted = old.replace(old_text, new_text) if replace_all else old.replace(old_text, new_text, 1)
                                 diff_lines = difflib.unified_diff(
-                                    old.splitlines(True),
-                                    predicted.splitlines(True),
-                                    fromfile="before",
-                                    tofile="after",
-                                    n=3,
+                                    old.splitlines(True), predicted.splitlines(True),
+                                    fromfile="before", tofile="after", n=3,
                                 )
                                 diff_text = "".join(list(diff_lines)[:DIFF_MAX_LINES])
                                 if diff_text.strip():
@@ -613,7 +673,6 @@ def _run_tool_loop(
                 except Exception:
                     pass
 
-            # Confirmación inteligente para borrados recursivos.
             if function_name == "delete_path" and bool(arguments.get("recursive")) and not arguments.get("confirm"):
                 if need_human_confirm and not DRY_RUN:
                     p = arguments.get("path") or ""
@@ -624,11 +683,9 @@ def _run_tool_loop(
                         arguments["confirm"] = True
                     else:
                         result = "Acción cancelada por el usuario."
-
                 if DRY_RUN:
                     result = "DRY_RUN: cancelado por preflight (confirm=false)."
 
-            # Confirmación inteligente para comandos peligrosos.
             if function_name == "run_command" and bool(arguments.get("allow_dangerous")) and not result:
                 if need_human_confirm and not DRY_RUN:
                     cmd = arguments.get("command") or ""
@@ -651,7 +708,6 @@ def _run_tool_loop(
                 else:
                     result = f"Herramienta desconocida: {function_name}"
 
-            # Resolución interactiva si `resolve_path` devuelve candidatos ambiguos.
             if (
                 function_name == "resolve_path"
                 and isinstance(result, str)
@@ -667,9 +723,7 @@ def _run_tool_loop(
                         if isinstance(candidates, list) and candidates:
                             console.print("[bold yellow]Resolución de ruta ambigua:[/bold yellow]")
                             for i, c in enumerate(candidates[:10]):
-                                console.print(
-                                    f"{i+1}. {c.get('name')} (score={c.get('score')}) -> {c.get('path')}"
-                                )
+                                console.print(f"{i+1}. {c.get('name')} (score={c.get('score')}) -> {c.get('path')}")
                             auto_pref = os.environ.get("AARIS_AUTO_RESOLVE_AMBIGUOUS", "").strip().lower()
                             chosen_path = None
                             if auto_pref in ("", "none", "off"):
@@ -699,13 +753,11 @@ def _run_tool_loop(
                                 idx = int(ans) - 1
                                 if 0 <= idx < len(candidates):
                                     chosen_path = candidates[idx].get("path")
-
                             if chosen_path:
                                 result = str(chosen_path)
                 except Exception:
                     pass
 
-            # Extraemos tokens de rollback si la tool devolvió un resultado exitoso.
             if result and not str(result).startswith("Error"):
                 m = re.search(r"ROLLBACK_TOKEN=([a-fA-F0-9]+)", str(result))
                 if m:
@@ -715,7 +767,6 @@ def _run_tool_loop(
                     toks = [x.strip() for x in m2.group(1).split(",") if x.strip()]
                     rollback_tokens_accum.extend(toks)
 
-            # Si ocurre un error y tenemos tokens, hacemos rollback automático.
             if result and str(result).startswith("Error") and rollback_tokens_accum and not DRY_RUN:
                 try:
                     rb_func = tool_map.get("rollback_tokens")
@@ -723,16 +774,9 @@ def _run_tool_loop(
                         tokens_str = ",".join(reversed(rollback_tokens_accum))
                         rb_res = rb_func(tokens=tokens_str, overwrite=True)
                         messages.append({"role": "tool", "name": "rollback_tokens", "content": str(rb_res)})
-                    reply_content = (
-                        "Ocurrió un error durante la ejecución de herramientas. "
-                        "Se intentó un rollback automático del último estado."
-                    )
-                    return reply_content
+                    return "Ocurrió un error durante la ejecución de herramientas. Se intentó un rollback automático del último estado."
                 except Exception:
-                    reply_content = (
-                        "Ocurrió un error durante la ejecución de herramientas (rollback automático falló)."
-                    )
-                    return reply_content
+                    return "Ocurrió un error durante la ejecución de herramientas (rollback automático falló)."
 
             rpreview = str(result)
             if len(rpreview) > 1200:
@@ -743,10 +787,7 @@ def _run_tool_loop(
             if len(tool_content) > 16000:
                 tool_content = tool_content[:16000] + "\n[...Truncado por seguridad de memoria...]"
 
-            tool_msg: dict[str, Any] = {
-                "role": "tool",
-                "content": tool_content,
-            }
+            tool_msg: dict[str, Any] = {"role": "tool", "content": tool_content}
             if function_name:
                 tool_msg["name"] = function_name
             messages.append(tool_msg)
@@ -756,30 +797,22 @@ def _run_tool_loop(
                 and os.environ.get("AARIS_TOOL_ERROR_HINT", "true").strip().lower()
                 in ("1", "true", "yes", "si", "sí", "on")
             ):
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": f"Corrige los argumentos de la tool `{function_name}` para resolver el error: {str(result)[:800]}",
-                    }
-                )
+                messages.append({
+                    "role": "system",
+                    "content": f"Corrige los argumentos de la tool `{function_name}` para resolver el error: {str(result)[:800]}",
+                })
 
         if rounds >= MAX_TOOL_ROUNDS:
             hit_round_limit = True
             break
 
     if hit_round_limit and not reply_content.strip():
-        messages.append(
-            {
-                "role": "user",
-                "content": "Resume en español qué hiciste y qué falta; no llames más herramientas en esta respuesta.",
-            }
-        )
+        messages.append({
+            "role": "user",
+            "content": "Resume en español qué hiciste y qué falta; no llames más herramientas en esta respuesta.",
+        })
         with console.status("[bold cyan]Síntesis…[/bold cyan]", spinner="dots"):
-            final = chat(
-                model=MODEL,
-                messages=messages,
-                options=options or None,
-            )
+            final = chat(model=MODEL, messages=messages, options=options or None)
         final_msg = final["message"]
         messages.append(final_msg)
         reply_content = final_msg.get("content") or ""
@@ -813,7 +846,6 @@ def _run_simple_chat_streaming(messages: list, options: dict) -> str:
     full_response = ""
     console.print("\n[bold purple]Asistente:[/bold purple] ", end="")
     try:
-        from ollama import chat
         stream = chat(model=MODEL, messages=messages, options=options or None, stream=True)
         for chunk in stream:
             token = chunk.get("message", {}).get("content") or ""
@@ -833,7 +865,6 @@ def main():
     prefix_messages = _build_prefix_messages(memory)
     messages: list[dict[str, Any]] = prefix_messages[:]
 
-    # Si el usuario configuró un workspace en memoria, intentamos chdir.
     try:
         prefs = memory.get("preferences") or {}
         ws_root = prefs.get("workspace_root") if isinstance(prefs, dict) else None
@@ -844,70 +875,40 @@ def main():
     except Exception:
         pass
 
+    available_tools = [
+        create_file, append_file, apply_template, apply_unified_patch,
+        read_file, edit_file, search_replace_in_file, create_folder,
+        insert_after, copy_path, detect_project, install_packages,
+        move_path, resolve_path, delete_path, exists_path, describe_path,
+        estimate_dir, count_dir_children_matches, disk_usage,
+        service_status, service_restart, service_wait_active,
+        service_health_report, service_restart_with_deps,
+        list_processes, tail_file, fuzzy_search_paths,
+        build_text_index, rag_query, project_workflow_suggest,
+        list_directory, glob_find, run_command, run_command_checked,
+        run_command_retry, policy_show, policy_set, policy_reset,
+        rollback, rollback_tokens, ast_list_functions, ast_read_function,
+        docker_ps, docker_logs, docker_exec, db_query_sqlite,
+        delegate_task, schedule_agent_task,
+    ]
+
+    tool_map = {f.__name__: f for f in available_tools}
+    tool_groups = _build_tool_groups(available_tools)
+    _turn_counter = 0
+
+    # Limpieza de backups antiguos al arrancar
+    _cleanup_old_backups(max_age_days=BACKUP_MAX_AGE_DAYS)
+
     console.print(
         Panel.fit(
             f"[bold blue]AARIS[/bold blue] — asistente local (modelo [cyan]{MODEL}[/cyan])\n"
             "Escribe salir / exit / quit para terminar.\n"
             "Comandos: `ver memoria`, `reset memoria`, `workspace show`, `set workspace <ruta>`.\n"
-            f"[dim]Opciones: OLLAMA_MODEL, OLLAMA_NUM_CTX, OLLAMA_TEMPERATURE, AARIS_MAX_TOOL_ROUNDS, AARIS_MAX_CONTEXT_MESSAGES[/dim]",
+            f"[dim]Opciones: OLLAMA_MODEL, OLLAMA_NUM_CTX, OLLAMA_TEMPERATURE, AARIS_MAX_TOOL_ROUNDS, "
+            f"AARIS_MAX_CONTEXT_MESSAGES, AARIS_BACKUP_MAX_AGE_DAYS[/dim]",
             border_style="blue",
         )
     )
-
-    available_tools = [
-        create_file,
-        append_file,
-        apply_template,
-        apply_unified_patch,
-        read_file,
-        edit_file,
-        search_replace_in_file,
-        create_folder,
-        insert_after,
-        copy_path,
-        detect_project,
-        install_packages,
-        move_path,
-        resolve_path,
-        delete_path,
-        exists_path,
-        describe_path,
-        estimate_dir,
-        count_dir_children_matches,
-        disk_usage,
-        service_status,
-        service_restart,
-        service_wait_active,
-        service_health_report,
-        service_restart_with_deps,
-        list_processes,
-        tail_file,
-        fuzzy_search_paths,
-        build_text_index,
-        rag_query,
-        project_workflow_suggest,
-        list_directory,
-        glob_find,
-        run_command,
-        run_command_checked,
-        run_command_retry,
-        policy_show,
-        policy_set,
-        policy_reset,
-        rollback,
-        rollback_tokens,
-        ast_list_functions,
-        ast_read_function,
-        docker_ps,
-        docker_logs,
-        docker_exec,
-        db_query_sqlite,
-        delegate_task,
-        schedule_agent_task,
-    ]
-
-    tool_map = {f.__name__: f for f in available_tools}
-    _turn_counter = 0
 
     import sys
     if "--server" in sys.argv:
@@ -920,7 +921,8 @@ def main():
                     data = json.loads(post_data.decode('utf-8'))
                     prompt = data.get('prompt', '')
                     msgs = prefix_messages[:] + [{"role": "user", "content": prompt}]
-                    reply = _run_tool_loop(msgs, available_tools, tool_map, opts)
+                    active = _select_tools(prompt, available_tools, tool_groups)
+                    reply = _run_tool_loop(msgs, active, tool_map, opts)
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json; charset=utf-8')
                     self.end_headers()
@@ -942,7 +944,8 @@ def main():
         if idx + 1 < len(sys.argv):
             prompt = sys.argv[idx + 1]
             msgs = prefix_messages[:] + [{"role": "user", "content": prompt}]
-            reply = _run_tool_loop(msgs, available_tools, tool_map, opts)
+            active = _select_tools(prompt, available_tools, tool_groups)
+            reply = _run_tool_loop(msgs, active, tool_map, opts)
             console.print(Markdown(reply))
         return
 
@@ -957,14 +960,9 @@ def main():
                 continue
 
             low = user_input.lower().strip()
+
             if low in ("reset memoria", "olvidar memoria", "borrar memoria"):
-                memory = {
-                    "memory_summary": "",
-                    "stable_facts": [],
-                    "preferences": {},
-                    "last_updated": "",
-                    "last_turns": [],
-                }
+                memory = {"memory_summary": "", "stable_facts": [], "preferences": {}, "last_updated": "", "last_turns": []}
                 _save_memory(memory_path, memory)
                 messages = _build_prefix_messages(memory)
                 console.print("[dim]Memoria reiniciada. Empiezas con contexto limpio.[/dim]")
@@ -1043,22 +1041,21 @@ def main():
                         continue
                     lines = []
                     with open(log_path, "r", encoding="utf-8") as f:
-                        for i, line in enumerate(f):
+                        for line in f:
                             lines.append(line)
-                    tail = lines[-10:]
-                    for line in tail:
+                    for line in lines[-10:]:
                         obj = json.loads(line)
                         ts = obj.get("ts")
                         user = obj.get("user")
-                        tool_calls = obj.get("tool_calls") or []
-                        tool_names = [tc.get("name") for tc in tool_calls]
-                        console.print(f"- {ts} | {user} | tools={tool_names}")
+                        tool_names = [tc.get("name") for tc in (obj.get("tool_calls") or [])]
+                        active_count = obj.get("active_tools_count", "?")
+                        console.print(f"- {ts} | {user} | tools={tool_names} | activas={active_count}")
                 except Exception as e:
                     console.print(f"[bold red]Error en history:[/bold red] {e}")
                 continue
 
             if low.startswith("history search "):
-                term = user_input[len("history search ") :].strip()
+                term = user_input[len("history search "):].strip()
                 if not term:
                     console.print("[dim]Uso: history search <texto>[/dim]")
                     continue
@@ -1073,11 +1070,7 @@ def main():
                                 matches += 1
                                 if matches <= 10:
                                     obj = json.loads(line)
-                                    ts = obj.get("ts")
-                                    user = obj.get("user")
-                                    tool_calls = obj.get("tool_calls") or []
-                                    tool_names = [tc.get("name") for tc in tool_calls]
-                                    console.print(f"- {ts} | {user} | tools={tool_names}")
+                                    console.print(f"- {obj.get('ts')} | {obj.get('user')} | tools={[tc.get('name') for tc in (obj.get('tool_calls') or [])]}")
                     if matches == 0:
                         console.print("[dim]Sin coincidencias.[/dim]")
                 except Exception as e:
@@ -1092,19 +1085,17 @@ def main():
                 console.print(f"- AARIS_USE_TRASH={os.environ.get('AARIS_USE_TRASH', 'true')}")
                 console.print(f"- AARIS_COMMAND_SANDBOX={os.environ.get('AARIS_COMMAND_SANDBOX', '(none)')}")
                 console.print(f"- Tools disponibles={len(available_tools)}")
+                console.print(f"- BACKUP_MAX_AGE_DAYS={BACKUP_MAX_AGE_DAYS}")
                 continue
 
             if low in ("workspace show", "workspace", "ver workspace"):
                 prefs = memory.get("preferences") or {}
                 ws_root = prefs.get("workspace_root") if isinstance(prefs, dict) else None
-                console.print(
-                    f"[bold purple]Workspace:[/bold purple] cwd={os.getcwd()}\n"
-                    f"workspace_root={ws_root or '(no configurado)'}"
-                )
+                console.print(f"[bold purple]Workspace:[/bold purple] cwd={os.getcwd()}\nworkspace_root={ws_root or '(no configurado)'}")
                 continue
 
             if low.startswith("set workspace "):
-                raw = user_input[len("set workspace ") :].strip()
+                raw = user_input[len("set workspace "):].strip()
                 resolved_ws = resolve_path(raw, must_exist=True)
                 if str(resolved_ws).startswith("Error:"):
                     console.print(f"[bold red]Error:[/bold red] {resolved_ws}")
@@ -1139,8 +1130,7 @@ def main():
                                 obj = json.loads(line)
                             except Exception:
                                 continue
-                            tool_calls = obj.get("tool_calls") or []
-                            for tc in tool_calls:
+                            for tc in (obj.get("tool_calls") or []):
                                 rp = tc.get("result_preview") or ""
                                 if "ROLLBACK_TOKEN=" in rp:
                                     m = re.search(r"ROLLBACK_TOKEN=([a-fA-F0-9]+)", rp)
@@ -1155,7 +1145,6 @@ def main():
                     if not last_token:
                         console.print("[dim]No encontré tokens de rollback en el último log.[/dim]")
                         continue
-
                     ans_overwrite = Prompt.ask("Si el destino existe, ¿lo sobreescribo? (s/N)", default="N").strip().lower()
                     overwrite = ans_overwrite in ("s", "si", "sí", "y", "yes")
                     res = rollback(last_token, overwrite=overwrite)
@@ -1168,7 +1157,6 @@ def main():
             if low.startswith("rollback "):
                 token = low.split(" ", 1)[1].strip()
                 if token:
-                    overwrite = False
                     ans_overwrite = Prompt.ask("¿Sobreescribir si existe? (s/N)", default="N").strip().lower()
                     overwrite = ans_overwrite in ("s", "si", "sí", "y", "yes")
                     res = rollback(token, overwrite=overwrite)
@@ -1185,25 +1173,21 @@ def main():
                     if not last_line:
                         console.print("[dim]No hay logs para reproducir todavía.[/dim]")
                         continue
-
                     last_log = json.loads(last_line)
                     tool_calls = last_log.get("tool_calls") or []
                     if not tool_calls:
                         console.print("[dim]El último log no tiene tool_calls.[/dim]")
                         continue
-
                     console.print(f"\n[bold]Replaying último (tool_calls={len(tool_calls)})[/bold]")
                     if DRY_RUN:
                         console.print("[dim]DRY_RUN está activo; no ejecuto durante replay.[/dim]")
                         for tc in tool_calls:
                             console.print(f"- {tc.get('name')}: {tc.get('arguments')}")
                         continue
-
                     ans = Prompt.ask("¿Ejecutar exactamente esas herramientas? (s/N)", default="N").strip().lower()
                     if ans not in ("s", "si", "sí", "y", "yes"):
                         console.print("[dim]Replay cancelado.[/dim]")
                         continue
-
                     for tc in tool_calls:
                         name = tc.get("name") or ""
                         args = tc.get("arguments") or {}
@@ -1220,6 +1204,9 @@ def main():
                     console.print(f"[bold red]Error en replay:[/bold red] {e}")
                     continue
 
+            # ----------------------------------------------------------------
+            # Turno principal
+            # ----------------------------------------------------------------
             plan_info: dict[str, Any] | None = None
             if PLAN_MODE in ("auto", "confirm"):
                 plan_info = _plan_turn(user_input, messages, opts)
@@ -1231,30 +1218,30 @@ def main():
                         console.print(f"- {step}")
                     for note in plan_info.get("safety_notes") or []:
                         console.print(f"[dim]Seguridad: {note}[/dim]")
-
                     if PLAN_MODE == "confirm":
                         ans = Prompt.ask("¿Ejecutar ahora? (s/N)", default="N").strip().lower()
                         if ans not in ("s", "si", "sí", "y", "yes"):
                             console.print("[dim]Ejecución cancelada. Te dejo el plan listo.[/dim]")
                             continue
 
-            # Mensaje al "worker" para seguir el plan (rol OpenClaw-like).
             if plan_info and plan_info.get("requires_tools"):
                 steps = plan_info.get("steps") or []
                 summary = plan_info.get("summary") or ""
                 steps_text = "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps[:8])]) if steps else "(sin pasos explícitos)"
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": "Eres el worker. Sigue el plan descrito para cumplir la tarea. "
-                        f"Resumen del plan: {summary}\nPasos:\n{steps_text}\n"
-                        "Usa herramientas solo para ejecutar acciones del plan y detente cuando el plan esté completo; "
-                        "si falta algo del plan, pide aclaración.",
-                    }
-                )
+                messages.append({
+                    "role": "system",
+                    "content": "Eres el worker. Sigue el plan descrito para cumplir la tarea. "
+                    f"Resumen del plan: {summary}\nPasos:\n{steps_text}\n"
+                    "Usa herramientas solo para ejecutar acciones del plan y detente cuando el plan esté completo; "
+                    "si falta algo del plan, pide aclaración.",
+                })
 
             turn_start_idx = len(messages)
             messages.append({"role": "user", "content": user_input})
+
+            # Selección dinámica de herramientas ← NUEVO
+            active_tools = _select_tools(user_input, available_tools, tool_groups)
+            console.print(f"[dim]Tools activas: {len(active_tools)}/{len(available_tools)}[/dim]")
 
             if _is_simple_conversational(user_input) and PLAN_MODE == "off":
                 reply_content = _run_simple_chat_streaming(messages, opts)
@@ -1262,14 +1249,13 @@ def main():
                 turn_tool_ms = 0
             else:
                 turn_tool_start = datetime.now().timestamp()
-                reply_content = _run_tool_loop(messages, available_tools, tool_map, opts)
+                reply_content = _run_tool_loop(messages, active_tools, tool_map, opts)
                 turn_tool_ms = int((datetime.now().timestamp() - turn_tool_start) * 1000)
-
                 if reply_content.strip():
                     console.print("\n[bold purple]Asistente:[/bold purple]")
                     console.print(Markdown(reply_content))
 
-            # Log simple tipo "Open Claw": usuario + tools usados + salida truncada.
+            # Log
             tool_calls_log: list = []
             try:
                 tool_calls_extracted: list[dict[str, Any]] = []
@@ -1283,15 +1269,13 @@ def main():
                             if name:
                                 tool_calls_extracted.append({"name": name, "arguments": args})
                     if m.get("role") == "tool":
-                        # El resultado de la tool está en content.
                         tool_results.append(m.get("content") or "")
 
                 tool_calls_log = []
                 for i, tc in enumerate(tool_calls_extracted):
                     res_preview = tool_results[i][:800] if i < len(tool_results) else ""
-                    tool_calls_log.append(
-                        {"name": tc["name"], "arguments": tc["arguments"], "result_preview": res_preview}
-                    )
+                    tool_calls_log.append({"name": tc["name"], "arguments": tc["arguments"], "result_preview": res_preview})
+
                 log_obj = {
                     "ts": _now_iso(),
                     "user": user_input,
@@ -1299,6 +1283,7 @@ def main():
                     "plan": plan_info,
                     "tool_calls": tool_calls_log,
                     "tool_call_count": len(tool_calls_log),
+                    "active_tools_count": len(active_tools),   # ← NUEVO: cuántas tools se mandaron
                     "tool_loop_ms": turn_tool_ms,
                     "assistant_preview": reply_content[:1200],
                 }
@@ -1306,7 +1291,6 @@ def main():
                 with open(log_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(log_obj, ensure_ascii=False) + "\n")
 
-                # Guardamos estado para undo/redo si hay tokens de rollback.
                 try:
                     tokens_found: list[str] = []
                     for tr in tool_results:
@@ -1320,13 +1304,11 @@ def main():
                     tokens_found = [t for t in tokens_found if t]
                     if tokens_found and tool_calls_log:
                         state = _load_undo_redo_state()
-                        state.setdefault("undo", []).append(
-                            {
-                                "ts": log_obj.get("ts"),
-                                "tool_calls": tool_calls_log,
-                                "rollback_tokens": list(dict.fromkeys(tokens_found))[-50:],
-                            }
-                        )
+                        state.setdefault("undo", []).append({
+                            "ts": log_obj.get("ts"),
+                            "tool_calls": tool_calls_log,
+                            "rollback_tokens": list(dict.fromkeys(tokens_found))[-50:],
+                        })
                         state["redo"] = []
                         _save_undo_redo_state(state)
                 except Exception:
@@ -1334,10 +1316,8 @@ def main():
             except Exception:
                 pass
 
-            # Mantener contexto controlado para no inflar la ventana.
             messages = _prune_messages(messages, keep_last=MAX_CONTEXT_MESSAGES)
 
-            # Persistir memoria entre sesiones (si no se reinició).
             _turn_counter += 1
             if _turn_counter % MEMORY_UPDATE_EVERY == 0 or tool_calls_log:
                 memory = _update_memory(messages, memory, opts)
